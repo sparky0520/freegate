@@ -1,0 +1,15 @@
+[[model]]
+provider = "groq"
+id = "openai/gpt-oss-20b"
+tier = 2
+supports_tools = true
+supports_vision = false
+context_window = 131072
+
+[[model]]
+provider = "unreachable-test"
+id = "offline-llama-8b"
+tier = 1
+supports_tools = false
+supports_vision = false
+context_window = 8192

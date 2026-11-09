@@ -1,0 +1,94 @@
+# Default model metadata for Freegate
+# Each model must have an entry here to be routable by the gateway.
+
+# --- Groq ---
+[[model]]
+provider = "groq"
+id = "openai/gpt-oss-20b"
+tier = 2
+supports_tools = true
+supports_vision = false
+context_window = 131072
+
+[[model]]
+provider = "groq"
+id = "openai/gpt-oss-120b"
+tier = 3
+supports_tools = true
+supports_vision = false
+context_window = 131072
+
+[[model]]
+provider = "groq"
+id = "qwen/qwen3.8-27b"
+tier = 2
+supports_tools = true
+supports_vision = false
+context_window = 131072
+
+# --- Google Gemini ---
+[[model]]
+provider = "gemini"
+id = "gemini-flash-latest"
+tier = 2
+supports_tools = true
+supports_vision = true
+context_window = 1048576
+
+[[model]]
+provider = "gemini"
+id = "gemini-3.8-flash"
+tier = 2
+supports_tools = true
+supports_vision = true
+context_window = 1048576
+
+[[model]]
+provider = "gemini"
+id = "gemini-3.1-pro-preview"
+tier = 3
+supports_tools = true
+supports_vision = true
+context_window = 2097152
+
+# --- OpenRouter (Free Tier) ---
+[[model]]
+provider = "openrouter"
+id = "liquid/lfm-3-1.7b:free"
+tier = 1
+supports_tools = true
+supports_vision = false
+context_window = 262144
+
+[[model]]
+provider = "openrouter"
+id = "nvidia/nemotron-3.5-lightning:free"
+tier = 2
+supports_tools = true
+supports_vision = false
+context_window = 131072
+
+[[model]]
+provider = "openrouter"
+id = "cohere/north-mini-code:free"
+tier = 3
+supports_tools = true
+supports_vision = false
+context_window = 131072
+
+[[model]]
+provider = "openrouter"
+id = "nvidia/nemotron-3.5-super-vl:free"
+tier = 2
+supports_tools = true
+supports_vision = true
+context_window = 131072
+
+# --- Ollama (Local) ---
+[[model]]
+provider = "ollama"
+id = "llama3:latest"
+tier = 1
+supports_tools = true
+supports_vision = false
+context_window = 8192

@@ -1,0 +1,16 @@
+listen = "127.0.0.1:8085"
+private_mode = false
+unknown_model = "auto"
+max_wait_seconds = 10
+
+[[provider]]
+name = "groq"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+trains_on_data = false
+
+[[provider]]
+name = "unreachable-test"
+base_url = "http://127.0.0.1:59999/v1"
+local = true
+trains_on_data = false
