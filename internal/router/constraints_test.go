@@ -95,6 +95,46 @@ func TestToolsConstraintNeverRoutesToNoTools(t *testing.T) {
 	}
 }
 
+// TestToolsConstraintNeverRoutesToTier1 verifies that even if a Tier 1 model has supports_tools=true,
+// tool-using requests reject Tier 1 and require Tier >= 2.
+func TestToolsConstraintNeverRoutesToTier1(t *testing.T) {
+	fakeTier1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("CRITICAL: tool-using request routed to Tier 1 model!")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"bad"}}]}`))
+	}))
+	defer fakeTier1.Close()
+
+	cfg := &config.Config{
+		Providers: []config.ProviderConfig{
+			{Name: "p1", BaseURL: fakeTier1.URL, Local: true},
+		},
+		Aliases: map[string]config.AliasConfig{
+			"auto": {Models: []string{"p1/m1"}},
+		},
+	}
+	meta := []config.ModelMetadata{
+		{Provider: "p1", ID: "m1", Tier: 1, SupportsTools: true},
+	}
+
+	reg := registry.New(cfg, meta)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	rtr := New(cfg, reg, fakeTier1.Client(), logger)
+
+	toolReq := `{"model":"auto","tools":[{"type":"function","function":{"name":"calc"}}],"messages":[{"role":"user","content":"calc 2+2"}]}`
+	parsed, err := ParseRequest(httptest.NewRequest(http.MethodPost, "/", nil), []byte(toolReq))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	rtr.Route(context.Background(), parsed, rec)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable when only Tier 1 is available for tools, got %d", rec.Code)
+	}
+}
+
 // Milestone 5 Acceptance Check 2:
 // Private mode never reaches a trains_on_data = true provider even when everything else is exhausted.
 func TestPrivateModeNeverReachesTrainingProvider(t *testing.T) {

@@ -201,7 +201,7 @@ context_window = 131072
 [[model]]
 provider = "gemini"
 id = "gemini-flash-latest"
-tier = 2
+tier = 3
 supports_tools = true
 supports_vision = true
 context_window = 1048576
@@ -209,14 +209,14 @@ context_window = 1048576
 [[model]]
 provider = "gemini"
 id = "gemini-3.8-flash"
-tier = 2
+tier = 3
 supports_tools = true
 supports_vision = true
 context_window = 1048576
 
 [[model]]
 provider = "gemini"
-id = "gemini-2.5-pro"
+id = "gemini-3.1-pro-preview"
 tier = 3
 supports_tools = true
 supports_vision = true
@@ -226,7 +226,7 @@ context_window = 2097152
 provider = "openrouter"
 id = "liquid/lfm-3-1.7b:free"
 tier = 1
-supports_tools = true
+supports_tools = false
 supports_vision = false
 context_window = 262144
 
@@ -241,8 +241,8 @@ context_window = 131072
 [[model]]
 provider = "openrouter"
 id = "cohere/north-mini-code:free"
-tier = 3
-supports_tools = true
+tier = 1
+supports_tools = false
 supports_vision = false
 context_window = 131072
 
@@ -250,7 +250,7 @@ context_window = 131072
 provider = "ollama"
 id = "llama3:latest"
 tier = 1
-supports_tools = true
+supports_tools = false
 supports_vision = false
 context_window = 8192
 `

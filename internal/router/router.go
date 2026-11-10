@@ -126,6 +126,10 @@ func (r *Router) FilterEligible(req *ParsedRequest, now time.Time) (eligible []*
 		if req.HasImages && !snap.SupportsVision {
 			continue
 		}
+		// Tool-using agent requests require capable models (Tier >= 2)
+		if req.HasTools && snap.Tier < 2 {
+			continue
+		}
 
 		// Hard constraint 4: context window
 		if snap.ContextWindow > 0 && snap.ContextWindow < requiredContext {
