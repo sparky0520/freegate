@@ -105,8 +105,9 @@ func TestMilestone4AcceptanceCheck(t *testing.T) {
 	if snap2.State != "ok" {
 		t.Errorf("expected bucket 2 state ok, got %s", snap2.State)
 	}
-	if !strings.Contains(logs.String(), "model changed") || !strings.Contains(logs.String(), "provider changed") {
-		t.Errorf("expected concise model and provider transition logs, got:\n%s", logs.String())
+	if !strings.Contains(logs.String(), "msg=\"model changed\"") ||
+		!strings.Contains(logs.String(), "msg=\"provider changed\"") {
+		t.Errorf("expected model and provider transition logs, got:\n%s", logs.String())
 	}
 }
 
@@ -154,11 +155,55 @@ func TestAllRateLimitedCandidatesAreTriedAndLogged(t *testing.T) {
 			t.Errorf("expected all five candidates to be tried, attempts: %s", attempts)
 		}
 	}
-	if !strings.Contains(logs.String(), "ALL ELIGIBLE PROVIDER LIMITS REACHED") {
+	if !strings.Contains(logs.String(), "ALL PROVIDER LIMITS REACHED") {
 		t.Errorf("expected provider limit exhaustion banner, logs:\n%s", logs.String())
 	}
 	if !strings.Contains(logs.String(), "providers=p1,p2,p3,p4,p5") {
 		t.Errorf("expected exhausted providers in summary, logs:\n%s", logs.String())
+	}
+}
+
+func TestExhaustionBannerAppearsForMixedFailures(t *testing.T) {
+	payloadTooLarge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+	}))
+	defer payloadTooLarge.Close()
+	rateLimited := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer rateLimited.Close()
+
+	cfg := &config.Config{
+		Providers: []config.ProviderConfig{
+			{Name: "p1", BaseURL: payloadTooLarge.URL, Local: true},
+			{Name: "p2", BaseURL: rateLimited.URL, Local: true},
+		},
+		Aliases: map[string]config.AliasConfig{
+			"auto": {Models: []string{"p1/model1", "p2/model2"}},
+		},
+	}
+	metadata := []config.ModelMetadata{
+		{Provider: "p1", ID: "model1", Tier: 2},
+		{Provider: "p2", ID: "model2", Tier: 2},
+	}
+	reg := registry.New(cfg, metadata)
+	var logs bytes.Buffer
+	rtr := New(cfg, reg, payloadTooLarge.Client(), slog.New(slog.NewTextHandler(&logs, nil)))
+	payload := `{"model":"auto","messages":[{"role":"user","content":"test"}]}`
+	parsed, err := ParseRequest(httptest.NewRequest(http.MethodPost, "/", strings.NewReader(payload)), []byte(payload))
+	if err != nil {
+		t.Fatalf("ParseRequest failed: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	rtr.Route(context.Background(), parsed, rec)
+
+	if !strings.Contains(logs.String(), "ALL ELIGIBLE ROUTES EXHAUSTED") {
+		t.Fatalf("expected generic exhaustion banner for mixed failures, logs:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), "ALL PROVIDER LIMITS REACHED") {
+		t.Fatalf("mixed failures must not be mislabeled as all limits reached, logs:\n%s", logs.String())
 	}
 }
 
