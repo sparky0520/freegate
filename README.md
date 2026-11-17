@@ -37,6 +37,7 @@ export GROQ_API_KEY="your-groq-key"
 
 - **OpenAI-Compatible Drop-In**: Serves standard `/v1/chat/completions` (streaming SSE and non-streaming) and `/v1/models`.
 - **Automatic Failover**: Seamlessly switches between providers and models on `429` (respects `Retry-After`), `5xx`, connection drops, and context-length errors.
+- **Readable Routing Logs**: Logs model/provider switches and shows an ASCII limit-exhaustion banner when every eligible route is rate-limited.
 - **Privacy-First Mode**: Tag providers with `trains_on_data = false`. When `private_mode` is enabled, prompts never cross into training providers even when quota is exhausted.
 - **Session Stickiness**: Pinned conversations via `X-Session-Id` or system/user hash (30-minute TTL) keep tool-using agents on the same model mid-task.
 - **Constraint-Aware Routing**: Inspects requests for `tools`, vision (`image_url`), and context size, filtering out unsupported models before attempting.

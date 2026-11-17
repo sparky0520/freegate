@@ -1,7 +1,9 @@
 package router
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -54,7 +56,8 @@ func TestMilestone4AcceptanceCheck(t *testing.T) {
 	}
 
 	reg := registry.New(cfg, metadata)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	rtr := New(cfg, reg, fake1.Client(), logger)
 
 	reqPayload := `{"model":"auto","messages":[{"role":"user","content":"hi"}]}`
@@ -101,6 +104,61 @@ func TestMilestone4AcceptanceCheck(t *testing.T) {
 	snap2 := b2.Snapshot(time.Now())
 	if snap2.State != "ok" {
 		t.Errorf("expected bucket 2 state ok, got %s", snap2.State)
+	}
+	if !strings.Contains(logs.String(), "model changed") || !strings.Contains(logs.String(), "provider changed") {
+		t.Errorf("expected concise model and provider transition logs, got:\n%s", logs.String())
+	}
+}
+
+func TestAllRateLimitedCandidatesAreTriedAndLogged(t *testing.T) {
+	limited := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limit exceeded"}}`))
+	}))
+	defer limited.Close()
+
+	cfg := &config.Config{
+		Aliases: map[string]config.AliasConfig{
+			"auto": {Models: []string{
+				"p1/model1", "p2/model2", "p3/model3", "p4/model4", "p5/model5",
+			}},
+		},
+	}
+	var metadata []config.ModelMetadata
+	for i := 1; i <= 5; i++ {
+		name := fmt.Sprintf("p%d", i)
+		cfg.Providers = append(cfg.Providers, config.ProviderConfig{
+			Name: name, BaseURL: limited.URL, Local: true,
+		})
+		metadata = append(metadata, config.ModelMetadata{
+			Provider: name, ID: fmt.Sprintf("model%d", i), Tier: 2,
+		})
+	}
+
+	reg := registry.New(cfg, metadata)
+	var logs bytes.Buffer
+	rtr := New(cfg, reg, limited.Client(), slog.New(slog.NewTextHandler(&logs, nil)))
+	payload := `{"model":"auto","messages":[{"role":"user","content":"test"}]}`
+	parsed, err := ParseRequest(httptest.NewRequest(http.MethodPost, "/", strings.NewReader(payload)), []byte(payload))
+	if err != nil {
+		t.Fatalf("ParseRequest failed: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	rtr.Route(context.Background(), parsed, rec)
+
+	attempts := rec.Header().Get("X-Freegate-Attempts")
+	for i := 1; i <= 5; i++ {
+		if !strings.Contains(attempts, fmt.Sprintf("p%d/model%d:429", i, i)) {
+			t.Errorf("expected all five candidates to be tried, attempts: %s", attempts)
+		}
+	}
+	if !strings.Contains(logs.String(), "ALL ELIGIBLE PROVIDER LIMITS REACHED") {
+		t.Errorf("expected provider limit exhaustion banner, logs:\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "providers=p1,p2,p3,p4,p5") {
+		t.Errorf("expected exhausted providers in summary, logs:\n%s", logs.String())
 	}
 }
 

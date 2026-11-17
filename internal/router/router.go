@@ -296,6 +296,7 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 
 	if len(eligible) == 0 {
 		if len(inCooldown) > 0 {
+			r.logLimitExhaustion(inCooldown, now)
 			minCooldown := inCooldown[0].Snapshot(now).CooldownUntil
 			for _, b := range inCooldown[1:] {
 				if b.Snapshot(now).CooldownUntil.Before(minCooldown) {
@@ -353,17 +354,18 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 	ordered := r.OrderBuckets(req, eligible, now)
 
 	var attempts []string
-	maxAttempts := 4
-	if len(ordered) < maxAttempts {
-		maxAttempts = len(ordered)
-	}
 
 	var lastErrResp *http.Response
 	var lastErrBody []byte
 	var lastErrStatusCode int
+	allFailuresAreLimits := true
+	lastFailureReason := ""
 
-	for i := 0; i < maxAttempts; i++ {
+	for i := range ordered {
 		bucket := ordered[i]
+		if i > 0 {
+			r.logBucketChange(ordered[i-1], bucket, lastFailureReason)
+		}
 		attemptTime := time.Now()
 
 		// Prepare rewritten request body
@@ -381,6 +383,8 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 		upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(rewrittenBytes))
 		if err != nil {
 			attempts = append(attempts, fmt.Sprintf("%s:req_err", bucket.Key()))
+			allFailuresAreLimits = false
+			lastFailureReason = "request_error"
 			continue
 		}
 
@@ -398,6 +402,8 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			bucket.RecordFailure(err.Error(), attemptTime)
 			attempts = append(attempts, fmt.Sprintf("%s:conn_err", bucket.Key()))
 			r.Logger.Warn("upstream connection error", "bucket", bucket.Key(), "err", err)
+			allFailuresAreLimits = false
+			lastFailureReason = "connection_error"
 			continue
 		}
 
@@ -411,8 +417,10 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			if IsQuotaExhaustionError(body) {
 				cooldownUntil = attemptTime.Add(10 * time.Minute)
 				r.Logger.Warn("upstream quota exhausted, cooling down for 10m", "bucket", bucket.Key())
+				lastFailureReason = "quota_exhausted"
 			} else {
 				r.Logger.Warn("rate limited upstream", "bucket", bucket.Key(), "cooldown_until", cooldownUntil)
+				lastFailureReason = "rate_limited"
 			}
 			bucket.RecordCooldown(cooldownUntil, "429 rate limit", attemptTime)
 			attempts = append(attempts, fmt.Sprintf("%s:429", bucket.Key()))
@@ -428,6 +436,8 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			bucket.RecordCooldown(attemptTime.Add(60*time.Second), "413 payload too large", attemptTime)
 			attempts = append(attempts, fmt.Sprintf("%s:413", bucket.Key()))
 			r.Logger.Warn("upstream payload too large, failing over", "bucket", bucket.Key())
+			allFailuresAreLimits = false
+			lastFailureReason = "payload_too_large"
 			continue
 		}
 
@@ -439,6 +449,8 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			bucket.RecordFailure(fmt.Sprintf("HTTP %d", resp.StatusCode), attemptTime)
 			attempts = append(attempts, fmt.Sprintf("%s:%d", bucket.Key(), resp.StatusCode))
 			r.Logger.Warn("upstream 5xx error", "bucket", bucket.Key(), "status", resp.StatusCode)
+			allFailuresAreLimits = false
+			lastFailureReason = "upstream_error"
 			continue
 		}
 
@@ -451,6 +463,8 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			bucket.Disable(fmt.Sprintf("auth error HTTP %d", resp.StatusCode))
 			attempts = append(attempts, fmt.Sprintf("%s:%d", bucket.Key(), resp.StatusCode))
 			r.Logger.Error("provider auth error, disabled bucket", "bucket", bucket.Key(), "status", resp.StatusCode)
+			allFailuresAreLimits = false
+			lastFailureReason = "authentication_error"
 			continue
 		}
 
@@ -463,6 +477,7 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			bucket.RecordCooldown(attemptTime.Add(10*time.Minute), "402 payment required", attemptTime)
 			attempts = append(attempts, fmt.Sprintf("%s:402", bucket.Key()))
 			r.Logger.Warn("upstream payment required, cooling down for 10m", "bucket", bucket.Key(), "error", ParseErrorMessage(body))
+			lastFailureReason = "payment_required"
 			continue
 		}
 
@@ -475,6 +490,8 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			bucket.Disable("model not found 404")
 			attempts = append(attempts, fmt.Sprintf("%s:404", bucket.Key()))
 			r.Logger.Warn("upstream model not found", "bucket", bucket.Key())
+			allFailuresAreLimits = false
+			lastFailureReason = "model_not_found"
 			continue
 		}
 
@@ -490,12 +507,15 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 				bucket.RecordCooldown(attemptTime.Add(60*time.Second), "TPM limit exceeded", attemptTime)
 				attempts = append(attempts, fmt.Sprintf("%s:400_tpm_limit", bucket.Key()))
 				r.Logger.Warn("model TPM/rate limit exceeded on 400, failing over", "bucket", bucket.Key())
+				lastFailureReason = "token_rate_limited"
 				continue
 			}
 
 			if IsContextLengthError(resp.StatusCode, body) {
 				attempts = append(attempts, fmt.Sprintf("%s:400_context_length", bucket.Key()))
 				// Look for a bucket with larger context window in subsequent attempts
+				allFailuresAreLimits = false
+				lastFailureReason = "context_length_exceeded"
 				continue
 			}
 
@@ -507,10 +527,13 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 				"bucket", bucket.Key(),
 				"error", ParseErrorMessage(body),
 			)
+			allFailuresAreLimits = false
+			lastFailureReason = "bad_request"
 			continue
 		}
 
 		// Success! (200 OK)
+		allFailuresAreLimits = false
 		attempts = append(attempts, fmt.Sprintf("%s:ok", bucket.Key()))
 		attemptsHeader := strings.Join(attempts, ",")
 
@@ -602,6 +625,13 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 	}
 
 	// All attempts exhausted
+	if allFailuresAreLimits {
+		_, inCooldown := r.FilterEligible(req, time.Now())
+		if len(inCooldown) > 0 {
+			r.logLimitExhaustion(inCooldown, time.Now())
+		}
+	}
+
 	attemptsHeader := strings.Join(attempts, ",")
 	w.Header().Set("X-Freegate-Attempts", attemptsHeader)
 	w.Header().Set("Content-Type", "application/json")
@@ -630,4 +660,49 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			"code":    "bad_gateway",
 		},
 	})
+}
+
+func (r *Router) logBucketChange(from, to *registry.Bucket, reason string) {
+	if from.ModelID != to.ModelID {
+		r.Logger.Info("model changed",
+			"from", from.ModelID,
+			"to", to.ModelID,
+			"reason", reason,
+		)
+	}
+	if from.Provider.Name != to.Provider.Name {
+		r.Logger.Info("provider changed",
+			"from", from.Provider.Name,
+			"to", to.Provider.Name,
+			"model", to.ModelID,
+			"reason", reason,
+		)
+	}
+}
+
+func (r *Router) logLimitExhaustion(buckets []*registry.Bucket, now time.Time) {
+	providers := make(map[string]struct{})
+	var retryAt time.Time
+	for _, bucket := range buckets {
+		snapshot := bucket.Snapshot(now)
+		providers[snapshot.Provider] = struct{}{}
+		if retryAt.IsZero() || snapshot.CooldownUntil.Before(retryAt) {
+			retryAt = snapshot.CooldownUntil
+		}
+	}
+
+	providerNames := make([]string, 0, len(providers))
+	for name := range providers {
+		providerNames = append(providerNames, name)
+	}
+	sort.Strings(providerNames)
+
+	var retryAfter time.Duration
+	if !retryAt.IsZero() {
+		retryAfter = retryAt.Sub(now).Round(time.Second)
+	}
+	r.Logger.Warn("+===[ ALL ELIGIBLE PROVIDER LIMITS REACHED ]===+",
+		"providers", strings.Join(providerNames, ","),
+		"retry_after", retryAfter,
+	)
 }
