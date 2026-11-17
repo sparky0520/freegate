@@ -19,6 +19,7 @@ type ParsedRequest struct {
 	MaxTokens       int
 	MaxTokensKey    string // field that carried max_tokens ("" if the client set none; we never inject one)
 	IsComplex       bool
+	ConciseMode     bool
 	SessionID       string
 	RawBody         []byte
 	ReqMap          map[string]json.RawMessage
@@ -71,6 +72,11 @@ func ParseRequest(r *http.Request, bodyBytes []byte) (*ParsedRequest, error) {
 	// 2. Stream
 	if sRaw, ok := reqMap["stream"]; ok {
 		_ = json.Unmarshal(sRaw, &p.Stream)
+	}
+
+	// Concise mode check (via X-Concise header or concise field)
+	if ch := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Concise"))); ch == "true" || ch == "1" || ch == "yes" {
+		p.ConciseMode = true
 	}
 
 	// 3. Tools / Functions

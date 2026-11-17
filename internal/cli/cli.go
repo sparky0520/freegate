@@ -164,6 +164,8 @@ listen = "127.0.0.1:8080"
 private_mode = false
 unknown_model = "auto"
 max_wait_seconds = 10
+min_completion_tokens = 1024
+concise_mode = false
 # local_api_key = "" # uncomment to require Bearer key for clients
 
 [[provider]]

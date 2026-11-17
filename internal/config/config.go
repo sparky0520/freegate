@@ -16,13 +16,15 @@ var defaultModelsData []byte
 
 // Config holds the gateway configuration.
 type Config struct {
-	Listen         string                 `toml:"listen"`
-	PrivateMode    bool                   `toml:"private_mode"`
-	UnknownModel   string                 `toml:"unknown_model"`
-	MaxWaitSeconds int                    `toml:"max_wait_seconds"`
-	LocalAPIKey    string                 `toml:"local_api_key"`
-	Providers      []ProviderConfig       `toml:"provider"`
-	Aliases        map[string]AliasConfig `toml:"alias"`
+	Listen              string                 `toml:"listen"`
+	PrivateMode         bool                   `toml:"private_mode"`
+	UnknownModel        string                 `toml:"unknown_model"`
+	MaxWaitSeconds      int                    `toml:"max_wait_seconds"`
+	MinCompletionTokens int                    `toml:"min_completion_tokens"`
+	ConciseMode         bool                   `toml:"concise_mode"`
+	LocalAPIKey         string                 `toml:"local_api_key"`
+	Providers           []ProviderConfig       `toml:"provider"`
+	Aliases             map[string]AliasConfig `toml:"alias"`
 }
 
 // ProviderConfig describes an upstream LLM provider.
@@ -59,10 +61,12 @@ type modelsFile struct {
 // DefaultConfig returns the default configuration.
 func DefaultConfig() *Config {
 	return &Config{
-		Listen:         "127.0.0.1:8080",
-		PrivateMode:    false,
-		UnknownModel:   "auto",
-		MaxWaitSeconds: 10,
+		Listen:              "127.0.0.1:8080",
+		PrivateMode:         false,
+		UnknownModel:        "auto",
+		MaxWaitSeconds:      10,
+		MinCompletionTokens: 1024,
+		ConciseMode:         false,
 		Providers: []ProviderConfig{
 			{
 				Name:         "groq",
@@ -151,6 +155,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.MaxWaitSeconds <= 0 {
 		cfg.MaxWaitSeconds = 10
+	}
+	if cfg.MinCompletionTokens <= 0 {
+		cfg.MinCompletionTokens = 1024
 	}
 	if cfg.Aliases == nil {
 		cfg.Aliases = make(map[string]AliasConfig)

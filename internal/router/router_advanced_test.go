@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -294,5 +295,128 @@ func TestDailyQuotaExhaustionCooldown(t *testing.T) {
 	// Cooldown until midnight UTC should be substantial (more than 10 minutes)
 	if snap.CooldownRemainingS <= 600 {
 		t.Fatalf("expected daily quota cooldown to wait until midnight UTC (>600s), got %d seconds", snap.CooldownRemainingS)
+	}
+}
+
+// Tests that X-Concise: true injects concise directive into the system prompt.
+func TestConciseModeDirectiveInjectedOnHeader(t *testing.T) {
+	var receivedBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		receivedBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		Providers: []config.ProviderConfig{
+			{Name: "p1", BaseURL: srv.URL, Local: true},
+		},
+		Aliases: map[string]config.AliasConfig{"auto": {Models: []string{"p1/m"}}},
+	}
+	meta := []config.ModelMetadata{
+		{Provider: "p1", ID: "m", Tier: 2, ContextWindow: 32768},
+	}
+
+	rtr, _ := newLearningRouter(cfg, meta, srv.Client())
+	httpReq := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"model":"auto","messages":[{"role":"user","content":"write a sorting algorithm"}]}`))
+	httpReq.Header.Set("X-Concise", "true")
+	parsed, _ := ParseRequest(httpReq, []byte(`{"model":"auto","messages":[{"role":"user","content":"write a sorting algorithm"}]}`))
+
+	rec := httptest.NewRecorder()
+	rtr.Route(context.Background(), parsed, rec)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	if !strings.Contains(receivedBody, "Output space is limited. Be concise") {
+		t.Fatalf("expected concise directive in upstream request body, got:\n%s", receivedBody)
+	}
+}
+
+// Tests that when output space is clamped, concise directive is automatically injected.
+func TestConciseModeDirectiveInjectedOnClamping(t *testing.T) {
+	var receivedBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		receivedBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		Providers: []config.ProviderConfig{
+			{Name: "p1", BaseURL: srv.URL, Local: true},
+		},
+		Aliases: map[string]config.AliasConfig{"auto": {Models: []string{"p1/m"}}},
+	}
+	meta := []config.ModelMetadata{
+		{Provider: "p1", ID: "m", Tier: 2, ContextWindow: 4000},
+	}
+
+	rtr, _ := newLearningRouter(cfg, meta, srv.Client())
+	// Client asks for 32000 max_tokens, but window is 4000 -> must clamp!
+	httpReq := httptest.NewRequest(http.MethodPost, "/", nil)
+	parsed, _ := ParseRequest(httpReq, []byte(`{"model":"auto","max_tokens":32000,"messages":[{"role":"user","content":"short query"}]}`))
+
+	rec := httptest.NewRecorder()
+	rtr.Route(context.Background(), parsed, rec)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	if !strings.Contains(receivedBody, "Output space is limited. Be concise") {
+		t.Fatalf("expected clamped request to automatically receive concise directive, got:\n%s", receivedBody)
+	}
+}
+
+// Tests that configurable min_completion_tokens excludes models with cramped output space.
+func TestMinCompletionTokensExcludesTightModels(t *testing.T) {
+	var p2Called int32
+	p1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("p1 should have been excluded due to cramped output space")
+	}))
+	defer p1.Close()
+
+	p2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&p2Called, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer p2.Close()
+
+	cfg := &config.Config{
+		MinCompletionTokens: 2000, // require at least 2000 output tokens
+		Providers: []config.ProviderConfig{
+			{Name: "p1", BaseURL: p1.URL, Local: true},
+			{Name: "p2", BaseURL: p2.URL, Local: true},
+		},
+		Aliases: map[string]config.AliasConfig{"auto": {Models: []string{"p1/tight", "p2/large"}}},
+	}
+	meta := []config.ModelMetadata{
+		// Prompt will be ~3000 tokens. p1 context is 4000 (leaves only ~600 tokens < 2000 required)
+		{Provider: "p1", ID: "tight", Tier: 2, ContextWindow: 4000},
+		// p2 context is 32000 (leaves > 28000 tokens >= 2000 required)
+		{Provider: "p2", ID: "large", Tier: 2, ContextWindow: 32000},
+	}
+
+	rtr, _ := newLearningRouter(cfg, meta, p2.Client())
+	// ~3000 estimated tokens prompt (12000 characters)
+	prompt := strings.Repeat("text ", 2400)
+	parsed, _ := ParseRequest(httptest.NewRequest(http.MethodPost, "/", nil), []byte(`{"model":"auto","messages":[{"role":"user","content":"`+prompt+`"}]}`))
+
+	rec := httptest.NewRecorder()
+	rtr.Route(context.Background(), parsed, rec)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	if atomic.LoadInt32(&p2Called) != 1 {
+		t.Fatalf("expected p2 to be called, got %d", atomic.LoadInt32(&p2Called))
 	}
 }

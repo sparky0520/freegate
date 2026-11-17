@@ -30,26 +30,39 @@ var hopByHopHeaders = map[string]bool{
 }
 
 const (
-	// minCompletionTokens is the room a model must leave for output after the
-	// prompt for it to be a useful candidate.
-	minCompletionTokens = 256
+	// defaultMinCompletionTokens is the default room a model must leave for output after the
+	// prompt for it to be a viable candidate.
+	defaultMinCompletionTokens = 512
 	// softCapTTL is how long a size ceiling learned from a "request too large"
 	// error without a durable limit stays in force.
 	softCapTTL = 60 * time.Second
 	// defaultTTFTTimeout is the maximum time to wait for the first chunk in a stream
 	defaultTTFTTimeout = 8 * time.Second
+	// conciseDirective is injected when concise mode is enabled or output space is tight
+	conciseDirective = "Output space is limited. Be concise: provide only the direct answer or code without conversational filler, preamble, or repetition."
 )
 
 // promptMargin pads the prompt estimate before comparing it with a context window.
 func promptMargin(estTokens int) int { return estTokens / 8 }
 
-// promptFits reports whether the prompt plus a minimal completion fits the window.
-func promptFits(window int, req *ParsedRequest, estTokens int) bool {
-	room := req.MaxTokens
-	if room > minCompletionTokens {
-		room = minCompletionTokens
+// minCompletionFor returns the minimum completion room required for a candidate model.
+func (r *Router) minCompletionFor(req *ParsedRequest) int {
+	min := r.Config.MinCompletionTokens
+	if min <= 0 {
+		min = defaultMinCompletionTokens
 	}
-	return window >= estTokens+promptMargin(estTokens)+room
+	if req.MaxTokensKey != "" && req.MaxTokens > 0 && req.MaxTokens < min {
+		return req.MaxTokens
+	}
+	return min
+}
+
+// promptFits reports whether the prompt plus a minimal completion fits the window.
+func promptFits(window int, req *ParsedRequest, estTokens int, minCompletion int) bool {
+	if minCompletion <= 0 {
+		minCompletion = defaultMinCompletionTokens
+	}
+	return window >= estTokens+promptMargin(estTokens)+minCompletion
 }
 
 // maxCompletionFor returns the largest completion that fits the window after
@@ -167,7 +180,8 @@ func (r *Router) FilterEligible(req *ParsedRequest, now time.Time) (eligible []*
 		estTokens := r.Calibrator.Calibrate(b.Provider.Name, req.EstimatedTokens)
 
 		// Hard constraint 4: context window.
-		if snap.ContextWindow > 0 && !promptFits(snap.ContextWindow, req, estTokens) {
+		minRoom := r.minCompletionFor(req)
+		if snap.ContextWindow > 0 && !promptFits(snap.ContextWindow, req, estTokens, minRoom) {
 			continue
 		}
 
@@ -313,6 +327,17 @@ func (r *Router) scoreBucket(b *registry.Bucket, req *ParsedRequest, now time.Ti
 	// 5. Recent failures penalty
 	score -= float64(snap.ConsecutiveFailures) * 40.0
 
+	// 6. Output headroom & clamping penalty:
+	// If a model has very tight output room left (< minRoom * 2), penalize it
+	// so models with comfortable output headroom are prioritized.
+	minRoom := r.minCompletionFor(req)
+	if snap.ContextWindow > 0 {
+		availableOutput := snap.ContextWindow - estTokens - promptMargin(estTokens)
+		if availableOutput < minRoom*2 && req.MaxTokens > availableOutput {
+			score -= 50.0
+		}
+	}
+
 	return score
 }
 
@@ -399,6 +424,44 @@ func sanitizeMessagesRaw(raw json.RawMessage) json.RawMessage {
 	if !modified {
 		return raw
 	}
+	cleaned, err := json.Marshal(msgs)
+	if err != nil {
+		return raw
+	}
+	return cleaned
+}
+
+func injectConciseDirectiveRaw(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return raw
+	}
+	var msgs []map[string]any
+	if err := json.Unmarshal(raw, &msgs); err != nil {
+		return raw
+	}
+
+	foundSystem := false
+	for _, m := range msgs {
+		role, _ := m["role"].(string)
+		if role == "system" {
+			foundSystem = true
+			if contentStr, ok := m["content"].(string); ok {
+				if !strings.Contains(contentStr, "Output space is limited") {
+					m["content"] = contentStr + "\n\n" + conciseDirective
+				}
+			}
+			break
+		}
+	}
+
+	if !foundSystem {
+		sysMsg := map[string]any{
+			"role":    "system",
+			"content": conciseDirective,
+		}
+		msgs = append([]map[string]any{sysMsg}, msgs...)
+	}
+
 	cleaned, err := json.Marshal(msgs)
 	if err != nil {
 		return raw
@@ -504,9 +567,10 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 
 	var attempts []string
 
-	// The client's original max_tokens, so a clamp for one bucket does not leak
-	// into the next attempt.
+	// The client's original max_tokens and messages, so a clamp or concise directive
+	// for one bucket does not leak into the next attempt.
 	origMaxRaw := req.ReqMap[req.MaxTokensKey]
+	origMsgsRaw := req.ReqMap["messages"]
 
 	var lastErrResp *http.Response
 	var lastErrBody []byte
@@ -531,12 +595,14 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 		// Prepare rewritten request body
 		newModelRaw, _ := json.Marshal(bucket.ModelID)
 		req.ReqMap["model"] = newModelRaw
+		req.ReqMap["messages"] = origMsgsRaw
 		if msgsRaw, ok := req.ReqMap["messages"]; ok {
 			req.ReqMap["messages"] = sanitizeMessagesRaw(msgsRaw)
 		}
 		// Clamp an explicit max_tokens to what this bucket's window leaves after
 		// the prompt, instead of letting a large client default cause a 400.
 		sentMax := 0
+		wasClamped := false
 		if req.MaxTokensKey != "" {
 			req.ReqMap[req.MaxTokensKey] = origMaxRaw
 			sentMax = req.MaxTokens
@@ -544,7 +610,17 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 				if clamped, mErr := json.Marshal(allowed); mErr == nil {
 					req.ReqMap[req.MaxTokensKey] = clamped
 					sentMax = allowed
+					wasClamped = true
 				}
+			}
+		}
+
+		// Concise Mode: if explicitly enabled, or if output had to be clamped,
+		// guide the model to be concise so it doesn't waste tokens on conversational filler.
+		isConcise := r.Config.ConciseMode || req.ConciseMode || wasClamped
+		if isConcise {
+			if msgsRaw, ok := req.ReqMap["messages"]; ok {
+				req.ReqMap["messages"] = injectConciseDirectiveRaw(msgsRaw)
 			}
 		}
 		rewrittenBytes, err := json.Marshal(req.ReqMap)
