@@ -47,6 +47,9 @@ type ModelMetadata struct {
 	SupportsTools  bool   `toml:"supports_tools"`
 	SupportsVision bool   `toml:"supports_vision"`
 	ContextWindow  int    `toml:"context_window"`
+	RPM            int    `toml:"rpm,omitempty"`
+	TPM            int    `toml:"tpm,omitempty"`
+	RPD            int    `toml:"rpd,omitempty"`
 }
 
 type modelsFile struct {

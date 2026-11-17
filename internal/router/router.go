@@ -29,13 +29,46 @@ var hopByHopHeaders = map[string]bool{
 	"Upgrade":             true,
 }
 
+const (
+	// minCompletionTokens is the room a model must leave for output after the
+	// prompt for it to be a useful candidate.
+	minCompletionTokens = 256
+	// softCapTTL is how long a size ceiling learned from a "request too large"
+	// error without a durable limit stays in force.
+	softCapTTL = 60 * time.Second
+	// defaultTTFTTimeout is the maximum time to wait for the first chunk in a stream
+	defaultTTFTTimeout = 8 * time.Second
+)
+
+// promptMargin pads the prompt estimate before comparing it with a context window.
+func promptMargin(estTokens int) int { return estTokens / 8 }
+
+// promptFits reports whether the prompt plus a minimal completion fits the window.
+func promptFits(window int, req *ParsedRequest, estTokens int) bool {
+	room := req.MaxTokens
+	if room > minCompletionTokens {
+		room = minCompletionTokens
+	}
+	return window >= estTokens+promptMargin(estTokens)+room
+}
+
+// maxCompletionFor returns the largest completion that fits the window after
+// the (padded) prompt, or 0 if the window is unknown.
+func maxCompletionFor(window int, req *ParsedRequest) int {
+	if window <= 0 {
+		return 0
+	}
+	return window - req.EstimatedTokens - req.EstimatedTokens/8
+}
+
 // Router handles request filtering, ordering, attempt loops, and failover.
 type Router struct {
-	Config   *config.Config
-	Registry *registry.Registry
-	Sessions *SessionStore
-	Client   *http.Client
-	Logger   *slog.Logger
+	Config     *config.Config
+	Registry   *registry.Registry
+	Sessions   *SessionStore
+	Client     *http.Client
+	Logger     *slog.Logger
+	Calibrator *TokenCalibrator
 }
 
 // New creates an initialized Router.
@@ -55,11 +88,12 @@ func New(cfg *config.Config, reg *registry.Registry, client *http.Client, logger
 	}
 
 	return &Router{
-		Config:   cfg,
-		Registry: reg,
-		Sessions: NewSessionStore(),
-		Client:   client,
-		Logger:   logger,
+		Config:     cfg,
+		Registry:   reg,
+		Sessions:   NewSessionStore(),
+		Client:     client,
+		Logger:     logger,
+		Calibrator: NewTokenCalibrator(),
 	}
 }
 
@@ -104,8 +138,6 @@ func (r *Router) FilterEligible(req *ParsedRequest, now time.Time) (eligible []*
 		candidates = r.Registry.AllBuckets()
 	}
 
-	requiredContext := req.EstimatedTokens + req.MaxTokens
-
 	for _, b := range candidates {
 		snap := b.Snapshot(now)
 
@@ -131,8 +163,16 @@ func (r *Router) FilterEligible(req *ParsedRequest, now time.Time) (eligible []*
 			continue
 		}
 
-		// Hard constraint 4: context window
-		if snap.ContextWindow > 0 && snap.ContextWindow < requiredContext {
+		// Calibrate estimated tokens for this provider
+		estTokens := r.Calibrator.Calibrate(b.Provider.Name, req.EstimatedTokens)
+
+		// Hard constraint 4: context window.
+		if snap.ContextWindow > 0 && !promptFits(snap.ContextWindow, req, estTokens) {
+			continue
+		}
+
+		// Hard constraint 4b: size ceiling learned from earlier failures
+		if snap.MaxPromptTokens > 0 && estTokens >= snap.MaxPromptTokens {
 			continue
 		}
 
@@ -147,10 +187,133 @@ func (r *Router) FilterEligible(req *ParsedRequest, now time.Time) (eligible []*
 			continue
 		}
 
+		// Hard constraint 7: proactive token budget
+		if snap.BudgetTokens >= 0 && int64(estTokens) > snap.BudgetTokens {
+			inCooldownOnly = append(inCooldownOnly, b)
+			continue
+		}
+
+		// Hard constraint 8: local rate limits (RPM, TPM, RPD)
+		remReq, remTok, remDaily, waitReq, waitTok, waitDaily := b.LocalQuotaLocked(now)
+		if (b.RPM > 0 && remReq <= 0) || (b.TPM > 0 && int64(estTokens) > remTok) || (b.RPD > 0 && remDaily <= 0) {
+			inCooldownOnly = append(inCooldownOnly, b)
+			_ = waitReq
+			_ = waitTok
+			_ = waitDaily
+			continue
+		}
+
 		eligible = append(eligible, b)
 	}
 
 	return eligible, inCooldownOnly
+}
+
+// waitUntil returns when a bucket that FilterEligible placed in the
+// "not now" list should become usable: its cooldown end, end of provider token window,
+// or local rate limit reset.
+func (r *Router) waitUntil(b *registry.Bucket, now time.Time) time.Time {
+	snap := b.Snapshot(now)
+	if snap.State == "cooldown" {
+		return snap.CooldownUntil
+	}
+	if !snap.BudgetResetAt.IsZero() {
+		return snap.BudgetResetAt
+	}
+
+	_, _, _, waitReq, waitTok, waitDaily := b.LocalQuotaLocked(now)
+	maxWait := waitReq
+	if waitTok > maxWait {
+		maxWait = waitTok
+	}
+	if waitDaily > maxWait {
+		maxWait = waitDaily
+	}
+	if maxWait > 0 {
+		return now.Add(maxWait)
+	}
+
+	return now
+}
+
+// recordTooLarge handles errors that mean "this request is too big" (HTTP 413,
+// or a 400 saying "request too large"). The bucket is NOT cooled down, since
+// smaller requests still work; instead it learns a size ceiling.
+func (r *Router) recordTooLarge(b *registry.Bucket, req *ParsedRequest, body []byte, sentMax int, now time.Time) {
+	if limit, _, ok := ParseRequestLimit(body); ok {
+		// The provider's limit covers prompt + completion; convert it into a
+		// ceiling on the prompt estimate, but never below half the limit so a
+		// huge max_tokens cannot drive the ceiling to ~0.
+		cap := limit - sentMax
+		if cap < limit/2 {
+			cap = limit / 2
+		}
+		b.RecordHardCap(cap)
+		return
+	}
+	estTokens := r.Calibrator.Calibrate(b.Provider.Name, req.EstimatedTokens)
+	b.RecordSoftCap(estTokens, now, now.Add(softCapTTL))
+}
+
+// scoreBucket calculates an intelligent ranking score based on tier, context headroom,
+// remaining quota, latency EWMA, and error rate.
+func (r *Router) scoreBucket(b *registry.Bucket, req *ParsedRequest, now time.Time) float64 {
+	snap := b.Snapshot(now)
+	estTokens := r.Calibrator.Calibrate(b.Provider.Name, req.EstimatedTokens)
+
+	var score float64
+
+	// 1. Tier score
+	if req.IsComplex {
+		score += float64(snap.Tier) * 100.0
+	} else {
+		score += float64(4-snap.Tier) * 100.0
+	}
+
+	// 2. Context headroom preference for large requests (> 4k tokens)
+	if estTokens >= 4000 && snap.ContextWindow > 0 {
+		headroom := float64(snap.ContextWindow - estTokens)
+		if headroom > 0 {
+			// Ratio of available window remaining
+			headroomRatio := headroom / float64(snap.ContextWindow)
+			// Boost models with huge headroom (e.g. Gemini 1M window for 100k prompt vs Groq 131k window)
+			score += headroomRatio * 80.0
+			if snap.ContextWindow >= 500000 {
+				score += 30.0 // bonus for mega-context models on large requests
+			}
+		} else {
+			score -= 100.0 // tight or no headroom
+		}
+	}
+
+	// 3. Remaining quota: unknown (-1) is treated as healthy, not zero!
+	if snap.RemainingRequests >= 0 {
+		if snap.RemainingRequests < 5 {
+			score -= float64(5-snap.RemainingRequests) * 15.0
+		} else {
+			score += 10.0
+		}
+	} else {
+		// Unknown (-1) quota: treat as healthy
+		score += 10.0
+	}
+
+	// Remaining tokens
+	if snap.RemainingTokens >= 0 {
+		if snap.RemainingTokens < int64(estTokens)*2 {
+			score -= 30.0
+		}
+	}
+
+	// 4. Latency EWMA: slight preference for faster models
+	if snap.LatencyMs > 0 {
+		score -= float64(snap.LatencyMs) / 200.0
+	}
+
+	// 5. Recent failures penalty
+	score -= float64(snap.ConsecutiveFailures) * 40.0
+
+	return score
 }
 
 // OrderBuckets sorts eligible buckets according to session stickiness, complexity, tier, and remaining quota.
@@ -182,32 +345,18 @@ func (r *Router) OrderBuckets(req *ParsedRequest, buckets []*registry.Bucket, no
 	sort.SliceStable(others, func(i, j int) bool {
 		bI := others[i]
 		bJ := others[j]
-		snapI := bI.Snapshot(now)
-		snapJ := bJ.Snapshot(now)
 
 		if isAuto {
-			// Complex/code/tools: tier 3 down to 1; Simple: tier 1 up to 3
-			if req.IsComplex {
-				if snapI.Tier != snapJ.Tier {
-					return snapI.Tier > snapJ.Tier
-				}
-			} else {
-				if snapI.Tier != snapJ.Tier {
-					return snapI.Tier < snapJ.Tier
-				}
+			scoreI := r.scoreBucket(bI, req, now)
+			scoreJ := r.scoreBucket(bJ, req, now)
+			if scoreI != scoreJ {
+				return scoreI > scoreJ
 			}
-
-			// Tie-break 1: remaining requests
-			if snapI.RemainingRequests != snapJ.RemainingRequests {
-				return snapI.RemainingRequests > snapJ.RemainingRequests
-			}
-			// Tie-break 2: remaining tokens
-			if snapI.RemainingTokens != snapJ.RemainingTokens {
-				return snapI.RemainingTokens > snapJ.RemainingTokens
-			}
-			// Tie-break 3: deterministic name
 			return bI.Key() < bJ.Key()
 		}
+
+		snapI := bI.Snapshot(now)
+		snapJ := bJ.Snapshot(now)
 
 		// For other aliases, use alias's own order; tie-break only if remaining quota differs
 		if snapI.RemainingRequests != snapJ.RemainingRequests && snapI.RemainingRequests >= 0 && snapJ.RemainingRequests >= 0 {
@@ -267,9 +416,9 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 	// Wait vs switch logic:
 	// If no bucket eligible only because of cooldowns and soonest cooldown is within max_wait, wait
 	if len(eligible) == 0 && len(inCooldown) > 0 {
-		minCooldown := inCooldown[0].Snapshot(now).CooldownUntil
+		minCooldown := r.waitUntil(inCooldown[0], now)
 		for _, b := range inCooldown[1:] {
-			u := b.Snapshot(now).CooldownUntil
+			u := r.waitUntil(b, now)
 			if u.Before(minCooldown) {
 				minCooldown = u
 			}
@@ -297,10 +446,10 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 	if len(eligible) == 0 {
 		if len(inCooldown) > 0 {
 			r.logRouteExhaustion(inCooldown, now)
-			minCooldown := inCooldown[0].Snapshot(now).CooldownUntil
+			minCooldown := r.waitUntil(inCooldown[0], now)
 			for _, b := range inCooldown[1:] {
-				if b.Snapshot(now).CooldownUntil.Before(minCooldown) {
-					minCooldown = b.Snapshot(now).CooldownUntil
+				if u := r.waitUntil(b, now); u.Before(minCooldown) {
+					minCooldown = u
 				}
 			}
 			retrySecs := int(minCooldown.Sub(now).Seconds())
@@ -355,6 +504,10 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 
 	var attempts []string
 
+	// The client's original max_tokens, so a clamp for one bucket does not leak
+	// into the next attempt.
+	origMaxRaw := req.ReqMap[req.MaxTokensKey]
+
 	var lastErrResp *http.Response
 	var lastErrBody []byte
 	var lastErrStatusCode int
@@ -366,11 +519,33 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 		}
 		attemptTime := time.Now()
 
+		// Half-Open circuit breaker: if bucket is in half-open state, ensure we acquire probe
+		isHalfOpen := bucket.State(attemptTime) == "half_open"
+		if isHalfOpen {
+			if !bucket.TryAcquireProbe(attemptTime) {
+				// Another concurrent request is already probing this bucket; skip it
+				continue
+			}
+		}
+
 		// Prepare rewritten request body
 		newModelRaw, _ := json.Marshal(bucket.ModelID)
 		req.ReqMap["model"] = newModelRaw
 		if msgsRaw, ok := req.ReqMap["messages"]; ok {
 			req.ReqMap["messages"] = sanitizeMessagesRaw(msgsRaw)
+		}
+		// Clamp an explicit max_tokens to what this bucket's window leaves after
+		// the prompt, instead of letting a large client default cause a 400.
+		sentMax := 0
+		if req.MaxTokensKey != "" {
+			req.ReqMap[req.MaxTokensKey] = origMaxRaw
+			sentMax = req.MaxTokens
+			if allowed := maxCompletionFor(bucket.ContextWindow, req); allowed > 0 && allowed < sentMax {
+				if clamped, mErr := json.Marshal(allowed); mErr == nil {
+					req.ReqMap[req.MaxTokensKey] = clamped
+					sentMax = allowed
+				}
+			}
 		}
 		rewrittenBytes, err := json.Marshal(req.ReqMap)
 		if err != nil {
@@ -380,6 +555,9 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 		upstreamURL := strings.TrimRight(bucket.Provider.BaseURL, "/") + "/chat/completions"
 		upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(rewrittenBytes))
 		if err != nil {
+			if isHalfOpen {
+				bucket.ReleaseProbe()
+			}
 			attempts = append(attempts, fmt.Sprintf("%s:req_err", bucket.Key()))
 			lastFailureReason = "request_error"
 			continue
@@ -396,6 +574,15 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 
 		resp, err := r.Client.Do(upstreamReq)
 		if err != nil {
+			if ctx.Err() != nil {
+				if isHalfOpen {
+					bucket.ReleaseProbe()
+				}
+				// The client went away; that says nothing about this provider, so
+				// it must not count toward the circuit breaker.
+				r.Logger.Info("client canceled request", "bucket", bucket.Key(), "duration", time.Since(start))
+				return
+			}
 			bucket.RecordFailure(err.Error(), attemptTime)
 			attempts = append(attempts, fmt.Sprintf("%s:conn_err", bucket.Key()))
 			r.Logger.Warn("upstream connection error", "bucket", bucket.Key(), "err", err)
@@ -410,8 +597,16 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			lastErrBody = body
 			lastErrStatusCode = http.StatusTooManyRequests
 			cooldownUntil := ParseRetryAfter(resp.Header.Get("Retry-After"), attemptTime)
-			if IsQuotaExhaustionError(body) {
-				cooldownUntil = attemptTime.Add(10 * time.Minute)
+			if IsDailyQuotaError(body) {
+				// Daily limit: cool down until midnight UTC
+				nextMidnight := time.Date(attemptTime.UTC().Year(), attemptTime.UTC().Month(), attemptTime.UTC().Day()+1, 0, 0, 0, 0, time.UTC)
+				cooldownUntil = nextMidnight
+				r.Logger.Warn("upstream daily quota exhausted, cooling down until midnight UTC", "bucket", bucket.Key(), "until", cooldownUntil)
+				lastFailureReason = "daily_quota_exhausted"
+			} else if IsQuotaExhaustionError(body) {
+				if cooldownUntil.Sub(attemptTime) < 10*time.Minute {
+					cooldownUntil = attemptTime.Add(10 * time.Minute)
+				}
 				r.Logger.Warn("upstream quota exhausted, cooling down for 10m", "bucket", bucket.Key())
 				lastFailureReason = "quota_exhausted"
 			} else {
@@ -429,7 +624,7 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			resp.Body.Close()
 			lastErrBody = body
 			lastErrStatusCode = http.StatusRequestEntityTooLarge
-			bucket.RecordCooldown(attemptTime.Add(60*time.Second), "413 payload too large", attemptTime)
+			r.recordTooLarge(bucket, req, body, sentMax, attemptTime)
 			attempts = append(attempts, fmt.Sprintf("%s:413", bucket.Key()))
 			r.Logger.Warn("upstream payload too large, failing over", "bucket", bucket.Key())
 			lastFailureReason = "payload_too_large"
@@ -454,9 +649,16 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			resp.Body.Close()
 			lastErrBody = body
 			lastErrStatusCode = resp.StatusCode
-			bucket.Disable(fmt.Sprintf("auth error HTTP %d", resp.StatusCode))
+
+			// 403 can happen when free models rotate or on model permission limits
+			if resp.StatusCode == http.StatusForbidden && (bucket.Provider.Name == "openrouter" || strings.Contains(string(body), "free") || strings.Contains(string(body), "model")) {
+				bucket.DisableUntil(attemptTime.Add(30*time.Minute), fmt.Sprintf("model 403 forbidden: %s", ParseErrorMessage(body)))
+				r.Logger.Warn("model 403 forbidden (temporary rotation), disabled for 30m", "bucket", bucket.Key(), "status", resp.StatusCode)
+			} else {
+				bucket.Disable(fmt.Sprintf("auth error HTTP %d", resp.StatusCode))
+				r.Logger.Error("provider auth error, disabled bucket", "bucket", bucket.Key(), "status", resp.StatusCode)
+			}
 			attempts = append(attempts, fmt.Sprintf("%s:%d", bucket.Key(), resp.StatusCode))
-			r.Logger.Error("provider auth error, disabled bucket", "bucket", bucket.Key(), "status", resp.StatusCode)
 			lastFailureReason = "authentication_error"
 			continue
 		}
@@ -480,9 +682,10 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			resp.Body.Close()
 			lastErrBody = body
 			lastErrStatusCode = http.StatusNotFound
-			bucket.Disable("model not found 404")
+			// OpenRouter free models rotate, so use a timed disable (30m) with re-probe
+			bucket.DisableUntil(attemptTime.Add(30*time.Minute), "model not found 404")
 			attempts = append(attempts, fmt.Sprintf("%s:404", bucket.Key()))
-			r.Logger.Warn("upstream model not found", "bucket", bucket.Key())
+			r.Logger.Warn("upstream model not found, disabled for 30m", "bucket", bucket.Key())
 			lastFailureReason = "model_not_found"
 			continue
 		}
@@ -493,6 +696,16 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			resp.Body.Close()
 			lastErrBody = body
 			lastErrStatusCode = http.StatusBadRequest
+
+			// "Request too large" depends on this request's size, not on the bucket's
+			// health: learn a size ceiling and fail over without a cooldown.
+			if IsRequestTooLarge(resp.StatusCode, body) {
+				r.recordTooLarge(bucket, req, body, sentMax, attemptTime)
+				attempts = append(attempts, fmt.Sprintf("%s:400_tpm_limit", bucket.Key()))
+				r.Logger.Warn("request too large for model, failing over", "bucket", bucket.Key())
+				lastFailureReason = "token_rate_limited"
+				continue
+			}
 
 			// Check if this 400 is actually a TPM / rate limit error from provider
 			if IsRateOrTPMLimitError(resp.StatusCode, body) {
@@ -505,7 +718,14 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 
 			if IsContextLengthError(resp.StatusCode, body) {
 				attempts = append(attempts, fmt.Sprintf("%s:400_context_length", bucket.Key()))
-				// Look for a bucket with larger context window in subsequent attempts
+				// Learn that prompts this large do not fit here, so the next request
+				// of this size skips the bucket instead of failing again. Smaller
+				// requests still use it.
+				estTokens := r.Calibrator.Calibrate(bucket.Provider.Name, req.EstimatedTokens)
+				bucket.RecordHardCap(estTokens)
+				if cw, ok := ParseContextWindowLimit(body); ok {
+					bucket.UpdateContextWindow(cw)
+				}
 				lastFailureReason = "context_length_exceeded"
 				continue
 			}
@@ -522,9 +742,82 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			continue
 		}
 
+		// Streaming verification: peek at first chunk with TTFT timeout BEFORE committing headers!
+		var firstChunk []byte
+		var readErr error
+
+		if req.Stream {
+			type chunkResult struct {
+				data []byte
+				err  error
+			}
+			ch := make(chan chunkResult, 1)
+			buf := make([]byte, 4096)
+
+			go func() {
+				n, err := resp.Body.Read(buf)
+				if n > 0 {
+					d := make([]byte, n)
+					copy(d, buf[:n])
+					ch <- chunkResult{data: d, err: err}
+				} else {
+					ch <- chunkResult{data: nil, err: err}
+				}
+			}()
+
+			select {
+			case <-ctx.Done():
+				resp.Body.Close()
+				if isHalfOpen {
+					bucket.ReleaseProbe()
+				}
+				r.Logger.Info("client canceled during stream TTFT wait", "bucket", bucket.Key())
+				return
+			case <-time.After(defaultTTFTTimeout):
+				resp.Body.Close()
+				bucket.RecordFailure("time to first token timeout (8s)", attemptTime)
+				attempts = append(attempts, fmt.Sprintf("%s:ttft_timeout", bucket.Key()))
+				r.Logger.Warn("upstream streaming TTFT timeout, failing over", "bucket", bucket.Key())
+				lastFailureReason = "stream_timeout"
+				continue
+			case res := <-ch:
+				firstChunk = res.data
+				readErr = res.err
+			}
+
+			if len(firstChunk) == 0 && readErr != nil {
+				resp.Body.Close()
+				bucket.RecordFailure("stream closed before first chunk: "+readErr.Error(), attemptTime)
+				attempts = append(attempts, fmt.Sprintf("%s:stream_err", bucket.Key()))
+				r.Logger.Warn("upstream stream closed before first chunk, failing over", "bucket", bucket.Key(), "err", readErr)
+				lastFailureReason = "stream_error"
+				continue
+			}
+
+			// Check if first chunk contains an SSE error payload!
+			if IsStreamErrorPayload(firstChunk) {
+				resp.Body.Close()
+				if IsRateOrTPMLimitError(http.StatusOK, firstChunk) {
+					bucket.RecordCooldown(attemptTime.Add(60*time.Second), "streaming rate limit error", attemptTime)
+					attempts = append(attempts, fmt.Sprintf("%s:stream_tpm", bucket.Key()))
+					lastFailureReason = "token_rate_limited"
+				} else {
+					bucket.RecordFailure("streaming error payload: "+string(firstChunk), attemptTime)
+					attempts = append(attempts, fmt.Sprintf("%s:stream_err_payload", bucket.Key()))
+					lastFailureReason = "stream_error"
+				}
+				r.Logger.Warn("upstream stream error payload in first chunk, failing over", "bucket", bucket.Key())
+				continue
+			}
+		}
+
 		// Success! (200 OK)
 		attempts = append(attempts, fmt.Sprintf("%s:ok", bucket.Key()))
 		attemptsHeader := strings.Join(attempts, ",")
+
+		// Record response latency
+		duration := time.Since(attemptTime)
+		bucket.RecordLatency(duration)
 
 		// Record session stickiness
 		if req.SessionID != "" {
@@ -533,7 +826,17 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 
 		// Parse proactive rate-limit headers
 		remReq, remTok, resetDur := ParseRateLimitHeaders(resp.Header, attemptTime)
+		detailedHeaders := ParseDetailedRateLimitHeaders(resp.Header, attemptTime)
 		bucket.RecordSuccess(remReq, remTok, attemptTime)
+
+		// Record budget window using token reset duration if available
+		budgetReset := detailedHeaders.ResetTokens
+		if budgetReset <= 0 {
+			budgetReset = detailedHeaders.ResetGeneral
+		}
+		if remTok >= 0 {
+			bucket.RecordBudgetWindow(budgetReset, attemptTime)
+		}
 		if (remReq == 0 || remTok == 0) && resetDur > 0 {
 			bucket.RecordCooldown(attemptTime.Add(resetDur), "proactive rate limit 0 remaining", attemptTime)
 		}
@@ -551,9 +854,24 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 
 		// Streaming vs non-streaming
 		if !req.Stream {
-			w.WriteHeader(resp.StatusCode)
-			_, _ = io.Copy(w, resp.Body)
+			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+
+			// Extract usage to calibrate token estimation and update local counters
+			var usageResp struct {
+				Usage struct {
+					PromptTokens int `json:"prompt_tokens"`
+				} `json:"usage"`
+			}
+			if err := json.Unmarshal(body, &usageResp); err == nil && usageResp.Usage.PromptTokens > 0 {
+				r.Calibrator.RecordUsage(bucket.Provider.Name, req.EstimatedTokens, usageResp.Usage.PromptTokens)
+				bucket.RecordLocalUsage(usageResp.Usage.PromptTokens, attemptTime)
+			} else {
+				bucket.RecordLocalUsage(req.EstimatedTokens, attemptTime)
+			}
+
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(body)
 			r.Logger.Info("handled chat request",
 				"bucket", bucket.Key(),
 				"stream", false,
@@ -563,44 +881,53 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			return
 		}
 
-		// Streaming SSE
+		// Streaming SSE: firstChunk was already verified
+		bucket.RecordLocalUsage(req.EstimatedTokens, attemptTime)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(resp.StatusCode)
 
 		flusher, _ := w.(http.Flusher)
-		if flusher != nil {
-			flusher.Flush()
+		if len(firstChunk) > 0 {
+			if _, wErr := w.Write(firstChunk); wErr != nil {
+				resp.Body.Close()
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
 		}
 
-		buf := make([]byte, 4096)
-		for {
-			n, rErr := resp.Body.Read(buf)
-			if n > 0 {
-				if _, wErr := w.Write(buf[:n]); wErr != nil {
-					resp.Body.Close()
-					return
-				}
-				if flusher != nil {
-					flusher.Flush()
-				}
-			}
-			if rErr != nil {
-				if rErr != io.EOF && !errors.Is(rErr, context.Canceled) && !errors.Is(ctx.Err(), context.Canceled) {
-					errJSON, _ := json.Marshal(map[string]any{
-						"error": map[string]string{
-							"message": "Upstream streaming read error: " + rErr.Error(),
-							"type":    "upstream_error",
-							"code":    "stream_error",
-						},
-					})
-					_, _ = w.Write([]byte("data: " + string(errJSON) + "\n\n"))
+		if readErr == nil {
+			buf := make([]byte, 4096)
+			for {
+				n, rErr := resp.Body.Read(buf)
+				if n > 0 {
+					if _, wErr := w.Write(buf[:n]); wErr != nil {
+						resp.Body.Close()
+						return
+					}
 					if flusher != nil {
 						flusher.Flush()
 					}
 				}
-				break
+				if rErr != nil {
+					if rErr != io.EOF && !errors.Is(rErr, context.Canceled) && !errors.Is(ctx.Err(), context.Canceled) {
+						errJSON, _ := json.Marshal(map[string]any{
+							"error": map[string]string{
+								"message": "Upstream streaming read error: " + rErr.Error(),
+								"type":    "upstream_error",
+								"code":    "stream_error",
+							},
+						})
+						_, _ = w.Write([]byte("data: " + string(errJSON) + "\n\n"))
+						if flusher != nil {
+							flusher.Flush()
+						}
+					}
+					break
+				}
 			}
 		}
 		resp.Body.Close()

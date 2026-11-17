@@ -60,7 +60,7 @@ func StatusCommand(addr string, out io.Writer) error {
 	}
 
 	w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "BUCKET\tTIER\tSTATE\tREMAINING (REQ/TOK)\tCOOLDOWN\tLAST ERROR")
+	fmt.Fprintln(w, "BUCKET\tTIER\tSTATE\tREMAINING (REQ/TOK)\tBUDGET\tCEILING\tCOOLDOWN\tLAST ERROR")
 
 	for _, b := range status.Buckets {
 		remReq := "-"
@@ -72,6 +72,16 @@ func StatusCommand(addr string, out io.Writer) error {
 			remTok = fmt.Sprintf("%d", b.RemainingTokens)
 		}
 		remaining := fmt.Sprintf("%s/%s", remReq, remTok)
+
+		budget := "-"
+		if b.BudgetTokens >= 0 {
+			budget = fmt.Sprintf("%d", b.BudgetTokens)
+		}
+
+		ceiling := "-"
+		if b.MaxPromptTokens > 0 {
+			ceiling = fmt.Sprintf("%d", b.MaxPromptTokens)
+		}
 
 		cooldown := "-"
 		if b.CooldownRemainingS > 0 {
@@ -90,11 +100,13 @@ func StatusCommand(addr string, out io.Writer) error {
 			state = "no_key"
 		}
 
-		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			b.Key,
 			b.Tier,
 			state,
 			remaining,
+			budget,
+			ceiling,
 			cooldown,
 			lastErr,
 		)

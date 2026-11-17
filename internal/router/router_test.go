@@ -413,10 +413,15 @@ func TestFailoverOnTPMLimit(t *testing.T) {
 		t.Errorf("expected attempts to show 400_tpm_limit failover, got %s", attempts)
 	}
 
-	// First bucket should be in cooldown
+	// "Request too large" depends on this request's size, not the bucket's health:
+	// the bucket must stay usable for smaller requests and learn a size ceiling
+	// from the provider-stated limit (8000) instead.
 	snap1 := reg.GetBucket("groq/gpt-120b").Snapshot(time.Now())
-	if snap1.State != "cooldown" {
-		t.Errorf("expected gpt-120b to be placed in cooldown, got state %s", snap1.State)
+	if snap1.State != "ok" {
+		t.Errorf("expected gpt-120b to stay usable for smaller requests, got state %s", snap1.State)
+	}
+	if snap1.MaxPromptTokens != 8000 {
+		t.Errorf("expected learned prompt ceiling of 8000, got %d", snap1.MaxPromptTokens)
 	}
 }
 

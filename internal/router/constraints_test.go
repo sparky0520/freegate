@@ -288,8 +288,10 @@ func TestContextWindowConstraint(t *testing.T) {
 	reg := registry.New(cfg, meta)
 	rtr := New(cfg, reg, fakeLarge.Client(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	// Long prompt: 2000 bytes -> 500 estimated tokens + 2000 max_tokens = 2500 required (exceeds 2000)
-	longPrompt := strings.Repeat("hello ", 400)
+	// Long prompt: 8400 bytes -> ~2100 estimated tokens, which cannot fit the 2000-token
+	// window even before leaving room for a completion. (An oversized max_tokens alone no
+	// longer excludes a model; it is clamped at send time. See TestMaxTokensClampedToWindow.)
+	longPrompt := strings.Repeat("hello ", 1400)
 	reqJSON := `{"model":"auto","max_tokens":2000,"messages":[{"role":"user","content":"` + longPrompt + `"}]}`
 	parsed, _ := ParseRequest(httptest.NewRequest(http.MethodPost, "/", nil), []byte(reqJSON))
 

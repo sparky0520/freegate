@@ -9,6 +9,8 @@ tier = 2
 supports_tools = true
 supports_vision = false
 context_window = 131072
+rpm = 30
+tpm = 6000
 
 [[model]]
 provider = "groq"
@@ -17,6 +19,8 @@ tier = 3
 supports_tools = true
 supports_vision = false
 context_window = 131072
+rpm = 30
+tpm = 6000
 
 [[model]]
 provider = "groq"
@@ -25,6 +29,8 @@ tier = 2
 supports_tools = true
 supports_vision = false
 context_window = 131072
+rpm = 30
+tpm = 6000
 
 # --- Google Gemini ---
 [[model]]
@@ -34,6 +40,9 @@ tier = 3
 supports_tools = true
 supports_vision = true
 context_window = 1048576
+rpm = 15
+tpm = 1000000
+rpd = 1500
 
 [[model]]
 provider = "gemini"
@@ -42,6 +51,9 @@ tier = 3
 supports_tools = true
 supports_vision = true
 context_window = 1048576
+rpm = 15
+tpm = 1000000
+rpd = 1500
 
 [[model]]
 provider = "gemini"
@@ -50,6 +62,9 @@ tier = 3
 supports_tools = true
 supports_vision = true
 context_window = 2097152
+rpm = 2
+tpm = 32000
+rpd = 50
 
 # --- OpenRouter (Free Tier) ---
 [[model]]
@@ -59,6 +74,8 @@ tier = 1
 supports_tools = false
 supports_vision = false
 context_window = 262144
+rpm = 20
+rpd = 200
 
 [[model]]
 provider = "openrouter"
@@ -67,6 +84,8 @@ tier = 2
 supports_tools = true
 supports_vision = false
 context_window = 131072
+rpm = 20
+rpd = 200
 
 [[model]]
 provider = "openrouter"
@@ -75,6 +94,8 @@ tier = 1
 supports_tools = false
 supports_vision = false
 context_window = 131072
+rpm = 20
+rpd = 200
 
 [[model]]
 provider = "openrouter"
@@ -83,6 +104,8 @@ tier = 2
 supports_tools = true
 supports_vision = true
 context_window = 131072
+rpm = 20
+rpd = 200
 
 # --- Ollama (Local) ---
 [[model]]
