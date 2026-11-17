@@ -26,6 +26,9 @@ type modelsResponse struct {
 		ID            string `json:"id"`
 		ContextWindow int    `json:"context_window"`
 		MaxModelLen   int    `json:"max_model_len"`
+		Metadata      struct {
+			ContextLength int `json:"context_length"`
+		} `json:"metadata"`
 	} `json:"data"`
 }
 
@@ -75,6 +78,9 @@ func DiscoverProvider(ctx context.Context, p *config.ProviderConfig, client *htt
 		cw := item.ContextWindow
 		if cw <= 0 && item.MaxModelLen > 0 {
 			cw = item.MaxModelLen
+		}
+		if cw <= 0 && item.Metadata.ContextLength > 0 {
+			cw = item.Metadata.ContextLength
 		}
 		models = append(models, DiscoveredModel{
 			ID:            item.ID,

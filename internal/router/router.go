@@ -454,6 +454,18 @@ func (r *Router) Route(ctx context.Context, req *ParsedRequest, w http.ResponseW
 			continue
 		}
 
+		// 402 Payment Required
+		if resp.StatusCode == http.StatusPaymentRequired {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+			resp.Body.Close()
+			lastErrBody = body
+			lastErrStatusCode = http.StatusPaymentRequired
+			bucket.RecordCooldown(attemptTime.Add(10*time.Minute), "402 payment required", attemptTime)
+			attempts = append(attempts, fmt.Sprintf("%s:402", bucket.Key()))
+			r.Logger.Warn("upstream payment required, cooling down for 10m", "bucket", bucket.Key(), "error", ParseErrorMessage(body))
+			continue
+		}
+
 		// 404 Model Not Found
 		if resp.StatusCode == http.StatusNotFound {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))

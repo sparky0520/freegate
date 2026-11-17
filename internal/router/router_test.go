@@ -491,6 +491,54 @@ func TestQuotaExhaustion10mCooldown(t *testing.T) {
 	}
 }
 
+func TestFailoverOn402PaymentRequired(t *testing.T) {
+	// Fake 1: returns 402 payment required
+	fake1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"error":{"message":"You need positive balance to do inference. Please add balance manually or setup top-up"}}`))
+	}))
+	defer fake1.Close()
+
+	// Fake 2: returns 200 OK
+	fake2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer fake2.Close()
+
+	cfg := &config.Config{
+		Providers: []config.ProviderConfig{
+			{Name: "deepinfra", BaseURL: fake1.URL, Local: true},
+			{Name: "fallback", BaseURL: fake2.URL, Local: true},
+		},
+		Aliases: map[string]config.AliasConfig{
+			"auto": {Models: []string{"deepinfra/deepseek", "fallback/model"}},
+		},
+	}
+	meta := []config.ModelMetadata{
+		{Provider: "deepinfra", ID: "deepseek", Tier: 1},
+		{Provider: "fallback", ID: "model", Tier: 2},
+	}
+	reg := registry.New(cfg, meta)
+	rtr := New(cfg, reg, fake1.Client(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	parsed, _ := ParseRequest(httptest.NewRequest(http.MethodPost, "/", nil), []byte(`{"model":"auto","messages":[{"role":"user","content":"test"}]}`))
+	rec := httptest.NewRecorder()
+
+	rtr.Route(context.Background(), parsed, rec)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	snap := reg.GetBucket("deepinfra/deepseek").Snapshot(time.Now())
+	if snap.CooldownRemainingS < 500 {
+		t.Errorf("expected 10-minute cooldown on 402 payment required, got %d seconds", snap.CooldownRemainingS)
+	}
+}
+
 func TestAll400sReturns400(t *testing.T) {
 	fake1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

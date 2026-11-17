@@ -91,6 +91,18 @@ api_key_env = "GEMINI_API_KEY"
 trains_on_data = true
 
 [[provider]]
+name = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+trains_on_data = true
+
+[[provider]]
+name = "deepinfra"
+base_url = "https://api.deepinfra.com/v1/openai"
+api_key_env = "DEEPINFRA_API_KEY"
+trains_on_data = false
+
+[[provider]]
 name = "ollama"
 base_url = "http://127.0.0.1:11434/v1"
 local = true

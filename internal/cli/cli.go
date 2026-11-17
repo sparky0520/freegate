@@ -173,6 +173,12 @@ api_key_env = "OPENROUTER_API_KEY"
 trains_on_data = true
 
 [[provider]]
+name = "deepinfra"
+base_url = "https://api.deepinfra.com/v1/openai"
+api_key_env = "DEEPINFRA_API_KEY"
+trains_on_data = false
+
+[[provider]]
 name = "ollama"
 base_url = "http://127.0.0.1:11434/v1"
 local = true
@@ -245,6 +251,30 @@ tier = 1
 supports_tools = false
 supports_vision = false
 context_window = 131072
+
+[[model]]
+provider = "deepinfra"
+id = "deepseek-ai/DeepSeek-V3"
+tier = 3
+supports_tools = true
+supports_vision = false
+context_window = 163840
+
+[[model]]
+provider = "deepinfra"
+id = "Qwen/Qwen3-30B-A3B"
+tier = 2
+supports_tools = true
+supports_vision = false
+context_window = 40960
+
+[[model]]
+provider = "deepinfra"
+id = "anthropic/claude-sonnet-5"
+tier = 3
+supports_tools = true
+supports_vision = true
+context_window = 1000000
 
 [[model]]
 provider = "ollama"

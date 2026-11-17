@@ -84,6 +84,31 @@ supports_tools = true
 supports_vision = true
 context_window = 131072
 
+# --- DeepInfra ---
+[[model]]
+provider = "deepinfra"
+id = "deepseek-ai/DeepSeek-V3"
+tier = 3
+supports_tools = true
+supports_vision = false
+context_window = 163840
+
+[[model]]
+provider = "deepinfra"
+id = "Qwen/Qwen3-30B-A3B"
+tier = 2
+supports_tools = true
+supports_vision = false
+context_window = 40960
+
+[[model]]
+provider = "deepinfra"
+id = "anthropic/claude-sonnet-5"
+tier = 3
+supports_tools = true
+supports_vision = true
+context_window = 1000000
+
 # --- Ollama (Local) ---
 [[model]]
 provider = "ollama"
