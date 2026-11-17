@@ -161,8 +161,6 @@ func IsQuotaExhaustionError(body []byte) bool {
 		[]byte("check your plan and billing"),
 		[]byte("credit balance is too low"),
 		[]byte("free-models-per-day"),
-		[]byte("positive balance"),
-		[]byte("add balance manually"),
 	}
 	for _, p := range patterns {
 		if bytes.Contains(lower, p) {

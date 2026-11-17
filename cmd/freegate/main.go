@@ -167,7 +167,7 @@ func runServer(args []string) {
 		"private_mode", cfg.PrivateMode,
 	)
 	if len(activeProviders) == 0 || (len(activeProviders) == 1 && activeProviders[0] == "ollama") {
-		logger.Warn("NO REMOTE API KEYS CONFIGURED! Add GROQ_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, or DEEPINFRA_API_KEY to .env or ~/.config/freegate/.env")
+		logger.Warn("NO REMOTE API KEYS CONFIGURED! Add GROQ_API_KEY, OPENROUTER_API_KEY, or GEMINI_API_KEY to .env or ~/.config/freegate/.env")
 	}
 
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {

@@ -80,12 +80,6 @@ func DefaultConfig() *Config {
 				TrainsOnData: true,
 			},
 			{
-				Name:         "deepinfra",
-				BaseURL:      "https://api.deepinfra.com/v1/openai",
-				APIKeyEnv:    "DEEPINFRA_API_KEY",
-				TrainsOnData: false,
-			},
-			{
 				Name:         "ollama",
 				BaseURL:      "http://127.0.0.1:11434/v1",
 				Local:        true,

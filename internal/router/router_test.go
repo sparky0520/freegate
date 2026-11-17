@@ -510,15 +510,15 @@ func TestFailoverOn402PaymentRequired(t *testing.T) {
 
 	cfg := &config.Config{
 		Providers: []config.ProviderConfig{
-			{Name: "deepinfra", BaseURL: fake1.URL, Local: true},
+			{Name: "paid", BaseURL: fake1.URL, Local: true},
 			{Name: "fallback", BaseURL: fake2.URL, Local: true},
 		},
 		Aliases: map[string]config.AliasConfig{
-			"auto": {Models: []string{"deepinfra/deepseek", "fallback/model"}},
+			"auto": {Models: []string{"paid/model-402", "fallback/model"}},
 		},
 	}
 	meta := []config.ModelMetadata{
-		{Provider: "deepinfra", ID: "deepseek", Tier: 1},
+		{Provider: "paid", ID: "model-402", Tier: 1},
 		{Provider: "fallback", ID: "model", Tier: 2},
 	}
 	reg := registry.New(cfg, meta)
@@ -533,7 +533,7 @@ func TestFailoverOn402PaymentRequired(t *testing.T) {
 		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	snap := reg.GetBucket("deepinfra/deepseek").Snapshot(time.Now())
+	snap := reg.GetBucket("paid/model-402").Snapshot(time.Now())
 	if snap.CooldownRemainingS < 500 {
 		t.Errorf("expected 10-minute cooldown on 402 payment required, got %d seconds", snap.CooldownRemainingS)
 	}
